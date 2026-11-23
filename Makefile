@@ -1,5 +1,5 @@
-VERSION ?= 0.1.0
-IMAGE ?= ghcr.io/haiku/importantadminportal
+VERSION ?= 0.1.1
+IMAGE ?= ghcr.io/kallisti5/importantadminportal
 ENGINE ?= podman
 
 default: build

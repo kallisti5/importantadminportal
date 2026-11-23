@@ -16,6 +16,10 @@ other bad actors.
 * Ignores requests whose source address is not publicly routable: loopback,
   RFC 1918, link-local, CGNAT, multicast, documentation and other reserved
   ranges are never logged or recorded.
+* Only treats abusive traffic as hostile: login attempts, probes for decoy
+  files (`.env`, SQL dumps, `.git/config`, etc.), and requests for unknown
+  paths. Plain page loads of the portal, including the front page, the login
+  form, static assets, and the linked admin pages, are not recorded.
 * Logs hostile requests to stdout with source IP, method, URI, user agent and
   referer.
 * Appends every hostile source IP to `ips.txt`, one address per line.

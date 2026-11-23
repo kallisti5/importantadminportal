@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Form, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -130,6 +130,40 @@ fn router(state: AppState) -> Router {
 // Request tracking
 // ---------------------------------------------------------------------------
 
+/// Paths that make up the portal itself. Plain page loads of these are not
+/// abusive: crawlers, link previewers, and curious visitors may browse the
+/// site without being added to the report.
+const BENIGN_PATHS: &[&str] = &[
+    "/",
+    "/admin",
+    "/admin/",
+    "/admin/login",
+    "/admin/logout",
+    "/admin/users",
+    "/admin/settings",
+    "/admin/audit",
+    "/admin/backups",
+    "/admin/integrations",
+    "/assets/portal.css",
+    "/robots.txt",
+    "/security.txt",
+    "/.well-known/security.txt",
+    "/favicon.ico",
+];
+
+/// A request is hostile when it is not a plain page load of the portal.
+///
+/// Login attempts (any non-GET/HEAD request, including form posts to
+/// `/admin/login`) and probes for decoy files or unknown paths are hostile.
+/// Loading the front page, the login form, static assets, and the linked
+/// portal pages is not.
+fn is_hostile(method: &Method, path: &str) -> bool {
+    if method != Method::GET && method != Method::HEAD {
+        return true;
+    }
+    !BENIGN_PATHS.contains(&path)
+}
+
 /// Log every hostile request and append the source to the IP report.
 ///
 /// `/report.txt` and `/healthz` are never tracked: operators and uptime
@@ -141,33 +175,44 @@ async fn observe_request(
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
+    let method = request.method().clone();
     let exempt = path == "/report.txt" || path == "/healthz";
     let peer_ip = peer.ip();
     let client_ip = ip::client_ip(request.headers(), peer_ip, state.config.trust_proxy_headers);
 
     if !exempt {
         if ip::is_public(client_ip) {
-            let method = request.method().as_str().to_string();
-            let uri = sanitize(&request.uri().to_string());
-            let user_agent = header(request.headers(), "user-agent");
-            let referer = header(request.headers(), "referer");
-            let forwarded_for = header(request.headers(), "x-forwarded-for");
+            if is_hostile(&method, &path) {
+                let method = method.as_str().to_string();
+                let uri = sanitize(&request.uri().to_string());
+                let user_agent = header(request.headers(), "user-agent");
+                let referer = header(request.headers(), "referer");
+                let forwarded_for = header(request.headers(), "x-forwarded-for");
 
-            let hits = state.hits.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::warn!(
-                ip = %client_ip,
-                peer = %peer_ip,
-                method = %method,
-                uri = %uri,
-                user_agent = %user_agent,
-                referer = %referer,
-                forwarded_for = %forwarded_for,
-                hits = hits,
-                "hostile request"
-            );
+                let hits = state.hits.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    ip = %client_ip,
+                    peer = %peer_ip,
+                    method = %method,
+                    uri = %uri,
+                    user_agent = %user_agent,
+                    referer = %referer,
+                    forwarded_for = %forwarded_for,
+                    hits = hits,
+                    "hostile request"
+                );
 
-            if let Err(err) = state.store.record(client_ip).await {
-                tracing::error!(ip = %client_ip, error = %err, "failed to record hostile ip");
+                if let Err(err) = state.store.record(client_ip).await {
+                    tracing::error!(ip = %client_ip, error = %err, "failed to record hostile ip");
+                }
+            } else {
+                tracing::debug!(
+                    ip = %client_ip,
+                    peer = %peer_ip,
+                    method = %method,
+                    path = %sanitize(&path),
+                    "ignoring benign request"
+                );
             }
         } else {
             tracing::debug!(
@@ -501,6 +546,17 @@ mod tests {
             .unwrap()
     }
 
+    fn login_request(path: &str, forwarded_for: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("x-forwarded-for", forwarded_for)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .extension(ConnectInfo("10.0.0.2:5555".parse::<SocketAddr>().unwrap()))
+            .body(Body::from("username=admin&password=hunter2"))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn hostile_requests_are_recorded() {
         let dir = tempfile::tempdir().unwrap();
@@ -558,5 +614,61 @@ mod tests {
         let response = app.oneshot(request("/.env", "10.0.0.9")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(store.read().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn browsing_the_portal_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, store) = test_app(&dir).await;
+
+        for path in [
+            "/",
+            "/admin/login",
+            "/admin",
+            "/admin/users",
+            "/admin/settings",
+            "/assets/portal.css",
+            "/robots.txt",
+            "/favicon.ico",
+        ] {
+            let response = app.clone().oneshot(request(path, "8.8.8.8")).await.unwrap();
+            assert!(response.status().is_success(), "{path}");
+        }
+
+        assert_eq!(store.read().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn login_attempts_are_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, store) = test_app(&dir).await;
+
+        let response = app
+            .oneshot(login_request("/admin/login", "8.8.8.8"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(store.read().await.unwrap(), "8.8.8.8\n");
+    }
+
+    #[tokio::test]
+    async fn decoy_probes_are_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, store) = test_app(&dir).await;
+
+        for (path, forwarded_for) in [
+            ("/.env", "8.8.8.8"),
+            ("/wp-config.php", "8.8.8.9"),
+            ("/uploads/export.sql", "8.8.8.10"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(path, forwarded_for))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+
+        assert_eq!(store.read().await.unwrap(), "8.8.8.8\n8.8.8.9\n8.8.8.10\n");
     }
 }
