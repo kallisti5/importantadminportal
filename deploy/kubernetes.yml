@@ -1,0 +1,100 @@
+# Reference Kubernetes manifest for the honeypot.
+#
+# Important:
+#   * Keep replicas at 1. The IP report is a local file, not shared storage.
+#   * The image runs as UID/GID 10001. A PersistentVolume is mounted root-owned
+#     by default, so the pod needs fsGroup: 10001 to be able to write to it.
+#     Without this the service exits with "Permission denied (os error 13)".
+#   * Adjust the image tag, storage class and ingress host for your cluster.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: importantadminportal-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: your-storage-class
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: importantadminportal
+  labels:
+    app: importantadminportal
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: importantadminportal
+  template:
+    metadata:
+      labels:
+        app: importantadminportal
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: portal
+          image: ghcr.io/haiku/importantadminportal:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: COMPACT_INTERVAL_SECS
+              value: "600"
+            - name: TRUST_PROXY_HEADERS
+              value: "true"
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: importantadminportal-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: importantadminportal
+spec:
+  selector:
+    app: importantadminportal
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
